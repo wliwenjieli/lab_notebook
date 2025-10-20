@@ -2,7 +2,7 @@ name: Daily Lab Notebook
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 00:00 UTC daily ≈ 8pm ET (DST) / 7pm ET (Standard)
+    - cron: "0 0 * * *"   # 00:00 UTC daily ≈ 8pm ET during DST, 7pm ET during Standard Time
   workflow_dispatch: {}
 
 permissions:
@@ -10,8 +10,8 @@ permissions:
   issues: write
 
 env:
-  REPO: lab_notebook
   TZ_DB: America/New_York
+  REPO_NAME: lab_notebook
 
 jobs:
   daily:
@@ -23,134 +23,130 @@ jobs:
         with:
           token: ${{ secrets.LABNOTEBOOK_TOKEN }}
 
-      - name: Compute dates in ${{ env.TZ_DB }}
+      - name: Compute local dates
         id: dates
+        shell: bash
         run: |
           export TZ="${TZ_DB}"
-          # "Today" at trigger time in local TZ
           TODAY="$(date +%F)"
-          # Yesterday in local TZ
           YDAY="$(date -d 'yesterday' +%F)"
-          echo "today=$TODAY" >> $GITHUB_OUTPUT
-          echo "yday=$YDAY" >> $GITHUB_OUTPUT
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          echo "yday=$YDAY"   >> "$GITHUB_OUTPUT"
 
       - name: Ensure base folders exist
         run: |
           mkdir -p theory experiments
 
       # ---------- 1) PROMPT FOR TODAY ----------
-      # Create (or upsert) a daily prompt Issue for TODAY at local 8pm
       - name: Open or update today's prompt issue
         uses: actions/github-script@v7
+        env:
+          TODAY: ${{ steps.dates.outputs.today }}
+          TZ_DB: ${{ env.TZ_DB }}
         with:
           github-token: ${{ secrets.LABNOTEBOOK_TOKEN }}
           script: |
-            const today = "${{ steps.dates.outputs.today }}";
             const owner = context.repo.owner;
-            const repo = context.repo.repo;
+            const repo  = context.repo.repo;
+            const today = process.env.TODAY;
+            const tz    = process.env.TZ_DB;
             const title = `Daily labnote prompt — ${today}`;
-            // search for existing open issue with same title
-            const issues = await github.rest.search.issuesAndPullRequests({
+
+            // search for existing issue
+            const search = await github.rest.search.issuesAndPullRequests({
               q: `repo:${owner}/${repo} is:issue in:title "${title}"`
             });
-            if (issues.data.items.length > 0) {
-              const number = issues.data.items[0].number;
-              await github.rest.issues.update({
-                owner, repo, issue_number: number,
-                state: "open"
-              });
-              // Add a gentle nudge comment
+
+            if (search.data.items.length > 0) {
+              const number = search.data.items[0].number;
+              await github.rest.issues.update({ owner, repo, issue_number: number, state: "open" });
               await github.rest.issues.createComment({
                 owner, repo, issue_number: number,
                 body: [
-                  `👋 It's your ${today} 8pm check-in (${process.env.TZ_DB}).`,
-                  `Reply here with your theory/experiment notes, or push files to the repo.`,
+                  `👋 ${today} 8pm (${tz}) check-in.`,
+                  `Reply here with your theory/experiment notes, or commit files to the repo:`,
                   "",
-                  "**Format suggestions:**",
-                  "- `theory/${today}-theory.md`",
-                  "- `experiments/${today}-experiments.md`",
+                  `- theory/${today}-theory.md`,
+                  `- experiments/${today}-experiments.md`
                 ].join("\n")
               });
             } else {
-              const issue = await github.rest.issues.create({
+              await github.rest.issues.create({
                 owner, repo, title,
                 body: [
-                  `🕗 Daily prompt for **${today}** (timezone: ${process.env.TZ_DB}).`,
+                  `🕗 Daily prompt for **${today}** (timezone: ${tz}).`,
                   "",
                   "Please add your notes by replying here, or commit files to:",
                   "- `theory/` → Theory Notes",
                   "- `experiments/` → Experiment Log",
                   "",
-                  "If there is no reply by **tomorrow 8pm**, I will auto-create entries marked **AUTO-GENERATED** using recent repo 
-activity."
+                  "If there is no reply by **tomorrow 8pm**, I will auto-create entries marked **AUTO-GENERATED** using recent repo activity."
                 ].join("\n")
               });
             }
 
       # ---------- 2) FALLBACK FOR YESTERDAY ----------
-      # If YDAY's prompt issue has NO reply by now, auto-create files and commit them
       - name: Check yesterday's prompt issue status
         id: yday_status
         uses: actions/github-script@v7
+        env:
+          YDAY: ${{ steps.dates.outputs.yday }}
         with:
           github-token: ${{ secrets.LABNOTEBOOK_TOKEN }}
           script: |
-            const yday = "${{ steps.dates.outputs.yday }}";
             const owner = context.repo.owner;
-            const repo = context.repo.repo;
+            const repo  = context.repo.repo;
+            const yday  = process.env.YDAY;
             const title = `Daily labnote prompt — ${yday}`;
 
             const search = await github.rest.search.issuesAndPullRequests({
               q: `repo:${owner}/${repo} is:issue in:title "${title}"`
             });
+
             if (search.data.items.length === 0) {
-              core.setOutput("needs_autogen", "true"); // No issue means no response; autogen
+              core.setOutput("needs_autogen", "true");
+              core.setOutput("issue_number", "");
               return;
             }
-            const issue = search.data.items[0];
-            const number = issue.number;
 
-            // Get comments; if there is any comment (non-bot), consider answered
-            const comments = await github.rest.issues.listComments({
-              owner, repo, issue_number: number, per_page: 100
-            });
+            const issue   = search.data.items[0];
+            const number  = issue.number;
+            const comments = await github.rest.issues.listComments({ owner, repo, issue_number: number, per_page: 100 });
 
-            const humanComments = comments.data.filter(c => !/github-actions|bot/i.test(c.user.type || c.user.login));
+            const humanComments = comments.data.filter(c => (c.user?.type || "").toLowerCase() !== "bot");
             const answered = humanComments.length > 0;
-
-            // also treat as answered if user closed the issue
             const isClosed = issue.state === "closed";
 
             core.setOutput("needs_autogen", (!answered && !isClosed) ? "true" : "false");
-            core.setOutput("issue_number", number.toString());
+            core.setOutput("issue_number", String(number));
 
-      - name: Gather simple activity digest (commits & issues) for YDAY
+      - name: Gather activity digest (commits & issues) for YDAY
         if: steps.yday_status.outputs.needs_autogen == 'true'
         id: digest
         uses: actions/github-script@v7
+        env:
+          YDAY:  ${{ steps.dates.outputs.yday }}
+          TODAY: ${{ steps.dates.outputs.today }}
+          TZ_DB: ${{ env.TZ_DB }}
         with:
           github-token: ${{ secrets.LABNOTEBOOK_TOKEN }}
           script: |
-            const { Octokit } = require("@octokit/core");
-            const octokit = github;
             const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const tz = process.env.TZ_DB;
+            const repo  = context.repo.repo;
+            const yday  = process.env.YDAY;
+            const today = process.env.TODAY;
+            const tz    = process.env.TZ_DB;
 
-            // Build a simple date window in local TZ for presentation purposes only
-            // (Data queries will be approximate, but good enough for a daily digest).
-            const yday = "${{ steps.dates.outputs.yday }}";
-            const today = "${{ steps.dates.outputs.today }}";
-
-            // Commits (last 24h UTC window as approximation)
-            const commits = await octokit.rest.repos.listCommits({
+            // commits in the UTC day window (approximation of 8pm→8pm window)
+            const commits = await github.rest.repos.listCommits({
               owner, repo, since: `${yday}T00:00:00Z`, until: `${today}T00:00:00Z`, per_page: 50
             });
-            const commitLines = commits.data.map(c => `- ${c.commit.author?.date?.slice(0,19).replace('T',' ')}Z — 
-${c.commit.message.split('\n')[0]} (${c.sha.slice(0,7)})`);
+            const commitLines = commits.data.map(c =>
+              `- ${String(c.commit.author?.date).slice(0,19).replace('T',' ')}Z — ${c.commit.message.split('\n')[0]} (${c.sha.slice(0,7)})`
+            );
 
-            // Recently updated issues (close/open/comment)
-            const issues = await octokit.rest.issues.listForRepo({
+            // issues updated since yday
+            const issues = await github.rest.issues.listForRepo({
               owner, repo, state: "all", per_page: 50, since: `${yday}T00:00:00Z`
             });
             const issueLines = issues.data.map(i => `- #${i.number} ${i.title} [${i.state}]`);
@@ -162,13 +158,14 @@ ${c.commit.message.split('\n')[0]} (${c.sha.slice(0,7)})`);
               commitLines.length ? commitLines.join("\n") : "_None_",
               "",
               "### Issues updated",
-              issueLines.length ? issueLines.join("\n") : "_None_",
+              issueLines.length ? issueLines.join("\n") : "_None_"
             ].join("\n");
 
             core.setOutput("digest_md", digest);
 
       - name: Create AUTO-GENERATED files for YDAY
         if: steps.yday_status.outputs.needs_autogen == 'true'
+        shell: bash
         run: |
           YDAY="${{ steps.dates.outputs.yday }}"
           THEORY="theory/${YDAY}-theory.md"
@@ -176,85 +173,94 @@ ${c.commit.message.split('\n')[0]} (${c.sha.slice(0,7)})`);
 
           {
             echo "# 🧠 Theory Notes — ${YDAY}"
-            echo ""
+            echo
             echo "> **AUTO-GENERATED** (no user response by next 8pm)."
-            echo ""
+            echo
             echo "## Concepts Developed"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## References & Inspirations"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Open Questions"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Next Directions"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Activity Digest"
-            echo ""
-            echo "${{ steps.digest.outputs.digest_md }}"
-            echo ""
+            echo
+            printf "%s\n" "${{ steps.digest.outputs.digest_md }}"
+            echo
             echo "## 🏷 Tags"
             echo "#theory #auto-generated"
           } > "$THEORY"
 
           {
             echo "# 🧪 Experiment Log — ${YDAY}"
-            echo ""
+            echo
             echo "> **AUTO-GENERATED** (no user response by next 8pm)."
-            echo ""
+            echo
             echo "## Goals"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Setup"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Procedure"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Observations & Results"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Analysis"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Next Steps"
             echo "- _Pending user input_"
-            echo ""
+            echo
             echo "## Activity Digest"
-            echo ""
-            echo "${{ steps.digest.outputs.digest_md }}"
-            echo ""
+            echo
+            printf "%s\n" "${{ steps.digest.outputs.digest_md }}"
+            echo
             echo "## 🏷 Tags"
             echo "#experiment #auto-generated"
           } > "$EXPTS"
 
       - name: Commit & push (if anything changed)
+        shell: bash
         run: |
-          git config user.name "labnote-bot"
+          git config user.name  "labnote-bot"
           git config user.email "labnote-bot@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then
             echo "Nothing to commit."
           else
-            git commit -m "Daily workflow: prompt for ${{ steps.dates.outputs.today }}; fallback/autogen for ${{ 
-steps.dates.outputs.yday }}"
+            git commit -m "Daily workflow: prompt for ${{ steps.dates.outputs.today }}; fallback/autogen for ${{ steps.dates.outputs.yday }}"
             git push
           fi
 
       - name: Comment on yesterday's issue (if auto-generated)
         if: steps.yday_status.outputs.needs_autogen == 'true' && steps.yday_status.outputs.issue_number != ''
         uses: actions/github-script@v7
+        env:
+          YDAY: ${{ steps.dates.outputs.yday }}
+          ISSUE_NUMBER: ${{ steps.yday_status.outputs.issue_number }}
         with:
           github-token: ${{ secrets.LABNOTEBOOK_TOKEN }}
           script: |
             const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const issue_number = Number("${{ steps.yday_status.outputs.issue_number }}");
-            const yday = "${{ steps.dates.outputs.yday }}";
+            const repo  = context.repo.repo;
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const yday = process.env.YDAY;
+
             await github.rest.issues.createComment({
               owner, repo, issue_number,
-              body: `⏱ No response by the next 8pm. Created **AUTO-GENERATED** entries:\n- \`theory/${yday}-theory.md\`\n- 
-\`experiments/${yday}-experiments.md\`\n\nYou can edit those files directly in a follow-up commit.`
+              body: [
+                "⏱ No response by the next 8pm. Created **AUTO-GENERATED** entries:",
+                `- \`theory/${yday}-theory.md\``,
+                `- \`experiments/${yday}-experiments.md\``,
+                "",
+                "You can edit those files directly in a follow-up commit."
+              ].join("\n")
             });
